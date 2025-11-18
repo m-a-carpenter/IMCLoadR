@@ -1,0 +1,451 @@
+---
+title: "IMCLoadR Vignette"
+author: "Meredith Carpenter"
+date: "2025-11-14"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{IMCLoadR Vignette}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+This vignette demonstrates how to load MCDV IMC exports into one Seurat v5 object per FOV using LoadIMCSegmented(), inspect QC, visualize intensities over the label mask (segmentation or centroids), and run basic dimensionality reduction and clustering. The loader writes provenance and spatial settings into the tools slot of each Seurat object (accessible with SeuratObject::Tool(obj)), and the examples below read from there.
+
+Dependencies: The loader only requires Seurat/SeuratObject. Optional packages (magick, terra, sf, etc.) are used only when relevant (e.g., segmentation). Install them if you want those features.
+
+# Setup
+
+We load commonly used packages. If you don't plan to rebuild segmentation or use overlay plots on the mask, terra/sf/magick are not strictly necessary.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+
+# Load installed package normally; fall back to dev load if needed
+if (requireNamespace("IMCLoadR", quietly = TRUE)) {
+  library(IMCLoadR)
+} else if (requireNamespace("pkgload", quietly = TRUE)) {
+  pkgload::load_all("..", export_all = FALSE)
+} else {
+  stop("Package 'IMCLoadR' not installed and 'pkgload' unavailable.")
+}
+
+library(Seurat)
+library(SeuratObject)
+
+#Optional, but used in plots and examples below
+
+library(ggplot2)
+library(magick) # reading the mask image
+library(scales) # palettes (optional)
+library(dplyr) # simple summarization
+library(future) # parallelism for some Seurat steps
+future::plan(sequential)
+
+set.seed(1234)
+```
+
+# Load per-FOV Seuart objects
+
+LoadIMCSegmented() ingests a top-level workspace (e.g., Workspace_010) exported from MCDV after cell segmentation and creates one Seurat v5 object per FOV. Expression goes to counts (optionally also to data), an optional asinh layer can be added, and segmentation polygons can be reconstructed from a label mask when available. The loader also write provenance and spatial details to the tools slot.
+
+```{r}
+topdir <- system.file("extdata/wsmin", package = "IMCLoadR")
+eval_has_data <- nzchar(topdir) && dir.exists(topdir)
+```
+
+```{r, eval=eval_has_data}
+objs <- LoadIMCSegmented(
+  top_dir = topdir,
+  keep_unlabeled_channels = FALSE,
+  add_asinh_layer = TRUE, 
+  asinh_cofactor = 5,
+  build_segmentation_from_mask = TRUE,
+  default_boundary = "segmentation",
+  verbose = TRUE,
+  spatial_rotate_k = 3 #rotate by 270º to align with the orientation of the slide image
+)
+```
+
+
+# Pick one FOV to explore
+
+There are 3 FOVs in this example data. We will work with the first object and extract a few convenient handles.
+
+```{r}
+obj <- objs[[1]]
+assay <- DefaultAssay(obj) # "IMC"
+fov <- SeuratObject::DefaultFOV(obj)
+assay; fov
+```
+
+# Inspect provenance, scale factors, QC
+
+The loader stores provenance and spatial information in the tools slot. We also confirm QC landed in metadata (access via obj[[]]).
+
+```{r}
+# Preferred: named tool key
+tool <- tryCatch(SeuratObject::Tool(obj, "LoadIMCSegmented"), error = function(e) NULL)
+
+# Paths / scale factors / orientation / provenance
+if (!is.null(tool)) {
+str(tool$paths)
+str(tool$scale_factors)
+str(tool$spatial_orientation)
+str(tool$provenance)
+}
+
+# Cell-level QC
+head(obj@meta.data[, c("cell_id","centroid_y","centroid_x","cell_area_um2","nCount_IMC","nFeature_IMC")])
+
+```
+
+You can visualize the QC summaries using standard Seurat plots. For metadata features (like nCount_IMC) you don't need to specify a layer, it will default to "counts", but if you want to avoid the warning, you can assign the layer.
+
+```{r fig.width=7, fig.height=5}
+# Violin plot of per-cell total intensity
+VlnPlot(obj, layer = "counts", features = "nCount_IMC", pt.size = 0) +
+ggtitle("Per-cell total intensity (nCount_IMC)")
+
+# QC scatter: counts vs detected features
+FeatureScatter(obj, feature1 = "nCount_IMC", feature2 = "nFeature_IMC") +
+ggtitle("IMC QC: counts vs detected features")
+```
+
+# Data normalization options
+
+If you added asinh layer during load (add_asinh_layer = TRUE), you can use that as a working layer and skip NormalizeData(). Scale from your chosen layer to scale.data:
+
+```{r}
+layers_now <- SeuratObject::Layers(obj[[assay]])
+src_layer  <- if ("asinh" %in% layers_now) "asinh" else if ("data" %in% layers_now) "data" else "counts"
+# Scale from that layer to 'scale.data'
+obj <- ScaleData(
+  object   = obj,
+  assay    = assay,
+  features = rownames(obj[[assay]]),
+  layer    = src_layer,
+  verbose  = TRUE
+)
+```
+
+If you want to normalize the data with Seurat's NormalizeData, prefer CLR for protein modalities:
+
+```{r}
+# Normalize from counts → data (IMC: prefer CLR over LogNormalize)
+#    CLR is commonly used for protein modalities; margin=2 is per-cell.
+obj <- NormalizeData(
+  object = obj,
+  assay  = assay,
+  normalization.method = "CLR",
+  margin = 2,
+  verbose = TRUE
+)
+```
+
+# A quick spatial view of on the microscope image
+
+If your work space includes mask images, you can plot features over the image using Seurat's spatial helpers. Alternatively, you can utilize IMCFovPlot() presented included in repository. Here, we use "pan CK" as an example feature.
+
+```{r fig.width=7, fig.height=5}
+suppressMessages(ImageFeaturePlot(obj, features = c("pan CK"), cols = c("white", "red")))
+```
+
+# Using segmentation coordinates from the loader 
+
+When the loader rebuilt segmentation (build_segmentation_from_mask = TRUE), it stashed the raw polygon coordinates in the tools slot. You can bring them directly into ggplot2.
+
+```{r fig.width=7, fig.height=5}
+# Get stored segmentation coords for this FOV
+seg_list <- NULL
+if (!is.null(tool) && !is.null(tool$segmentation_coords)) {
+seg_list <- tool$segmentation_coords
+} else if (!is.null(obj@tools[["LoadIMCSegmented"]][["segmentation_coords"]])) {
+seg_list <- obj@tools[["LoadIMCSegmented"]][["segmentation_coords"]]
+}
+
+if (is.list(seg_list) && !is.null(seg_list[[fov]])) {
+  seg_df <- seg_list[[fov]] # columns: cell, x, y
+  stopifnot(all(c("cell","x","y") %in% names(seg_df)))
+  
+  #pick a layer and feature from the data
+  lyr_available <- SeuratObject::Layers(obj[[assay]])
+  lyr_to_use <- if ("asinh" %in% lyr_available) "asinh" else if ("data" %in% lyr_available) "data" else "counts"
+  M <- SeuratObject::LayerData(obj[[assay]], layer = lyr_to_use)
+  
+  example_feature <- "Vimentin"
+  if (!example_feature %in% rownames(M)) {
+  # fall back gracefully to the first feature
+  example_feature <- rownames(M)[1]
+  message("Feature not found; using fallback: ", example_feature)
+  }
+  
+  vals <- as.numeric(M[example_feature, , drop = TRUE])
+  vals_df <- data.frame(cell = colnames(M), val = vals, check.names = FALSE)
+  
+  poly <- merge(seg_df, vals_df, by = "cell", all.x = TRUE)
+  
+  ggplot(poly, aes(x = y, y = x, group = cell, fill = val)) +
+  geom_polygon(color = NA) +
+  coord_fixed() +
+  scale_fill_viridis_c(name = example_feature) +
+  labs(title = paste("Segmentation fill by", example_feature, sprintf("(%s)", lyr_to_use))) +
+  theme_void()
+}
+```
+
+# Evaluate and select features based on variance
+
+For IMC, many workflows keep most/all proteins. If you want an automatic subset, rank by variance on your chosen layer and keep proteins with highest variance.
+
+```{r}
+layers_now <- SeuratObject::Layers(obj[[assay]])
+src_layer <- if ("asinh" %in% layers_now) "asinh" else if ("data" %in% layers_now) "data" else "counts"
+
+M_asinh <- SeuratObject::LayerData(obj[[assay]], layer = src_layer)
+rv <- apply(M_asinh, 1, stats::var, na.rm = TRUE)
+rv[!is.finite(rv)] <- 0
+
+# keep all (change to min(30, length(rv)) for top 30)
+vf <- names(sort(rv, decreasing = TRUE))[seq_len(length(rv))]
+VariableFeatures(obj) <- vf
+length(vf); head(vf)
+```
+
+# Dimensionality reduction and clustering (expression space)
+
+We will do PCA/UMAP on the scaled layer and cluster in the expression space. We also show how to cluster using the spatial reduction separately.
+
+```{r fig.width=7, fig.height=5}
+assay <- DefaultAssay(obj)
+
+# Optional: Remove stale reductions/graphs
+obj@reductions$pca  <- NULL
+obj@reductions$umap <- NULL
+obj@graphs$pca_nn <- obj@graphs$pca_snn <- NULL
+
+# PCA 
+npcs <- min(10, max(2, floor(length(vf) / 3)))
+obj <- suppressWarnings(RunPCA(
+  object   = obj,
+  assay    = assay,
+  features = vf,
+  npcs     = npcs,
+  approx   = FALSE,
+  layer    = "scale.data"
+))
+
+# Neighbord & expression clusters
+obj <- FindNeighbors(obj, reduction = "pca", dims = 1:npcs,
+                     graph.name = c("pca_nn","pca_snn"))
+obj <- FindClusters(obj,  graph.name = "pca_snn", resolution = 0.4,
+                    cluster.name = "expr_clusters", random.seed = 1234)
+
+# UMAP
+obj <- suppressWarnings(RunUMAP(
+  object      = obj,
+  reduction   = "pca",
+  dims        = 1:npcs,
+  umap.method = "uwot",
+  metric      = "cosine",
+  n.neighbors = 30,
+  min.dist    = 0.3,
+  spread      = 1.0,
+  seed.use    = 1234
+))
+
+# Quick diagnostics
+print(Stdev(obj, reduction = "pca"))   # should decay; if flat, reduce features/clean panel
+ElbowPlot(obj, ndims = npcs)
+```
+
+```{r fig.width=7, fig.height=10}
+VizDimLoadings(obj, dims = 1:4, reduction = "pca")
+DimHeatmap(obj, dims = 1:6, balanced = TRUE, fast = FALSE)
+```
+
+```{r fig.width=7, fig.height=5}
+# (Optional) spatial neighbors/clusters using the spatial reduction
+obj <- FindNeighbors(obj, reduction = "spatial", dims = 1:2,
+                     graph.name = c("spatial_nn","spatial_snn"))
+obj <- FindClusters(obj,  graph.name = "spatial_snn", resolution = 0.4,
+                    cluster.name = "spatial_clusters", random.seed = 1234)
+
+# UMAP by expression clusters
+DimPlot(obj, reduction = "umap", group.by = "expr_clusters", label = TRUE) +
+  ggtitle("UMAP (expression space)")
+```
+
+
+# Overlay clusters on the FOV (centroids vs segmentation)
+
+You can toggle between boundaries. If segmentation was not built, the loader still adds centroids.
+
+```{r fig.width=7, fig.height=5}
+fov <- SeuratObject::DefaultFOV(obj)
+
+# Expression clusters over centroids
+p1 <- ImageDimPlot(
+  obj, fov = fov, boundaries = "centroids",
+  group.by = "expr_clusters", size = 0.6
+) + ggtitle("Centroids by expression clusters")
+
+# Spatial clusters over segmentation (fallback to centroids if needed - segmentation not run)
+boundary_to_use <- if ("segmentation" %in% names(obj[[fov]])) "segmentation" else "centroids"
+p2 <- ImageDimPlot(
+  obj, fov = fov, boundaries = boundary_to_use,
+  group.by = "spatial_clusters"
+) + ggtitle(sprintf("%s by spatial clusters",
+                    if (boundary_to_use == "segmentation") "Segmentation" else "Centroids"))
+
+p1 ; p2
+```
+
+# Spatial graph clustering (alternative)
+
+If you want a single "spatial_clusters" label backed directly by the spatial NN graph:
+
+```{r}
+# If you did not build a spatial graph yet, build it here
+
+if (!"spatial_nn" %in% names(SeuratObject::Graphs(obj))) {
+obj <- FindNeighbors(obj, reduction = "spatial", dims = 1:2,
+k.param = 15, graph.name = "spatial_nn")
+}
+
+# Cluster on spatial graph (keep a copy, void changing the active identity)
+obj <- FindClusters(obj, graph.name = "spatial_nn",
+                    resolution = 0.4, random.seed = 1234)
+obj$spatial_clusters <- Idents(obj)  # keep a copy
+Idents(obj) <- obj$expr_clusters   # restore expression clusters as active
+
+
+
+```
+
+# Expression and Spatial Cluster Markers
+
+Marker discovery finds the markers strongly associated with the clusters defined in the dimensionality reductions above. Here, we find the top positive markers associated with the expression clusters and the spatial clusters.
+
+```{r}
+# Expression-cluster markers
+Idents(obj) <- obj$expr_clusters
+markers_expr <- FindAllMarkers(
+  obj, assay = assay, layer = "asinh",
+  only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25
+)
+
+# Top markers per expression cluster
+top_markers_expr <- markers_expr %>%
+group_by(cluster) %>%
+slice_max(order_by = avg_log2FC, n = 5) %>%
+ungroup()
+
+dplyr::select(top_markers_expr, cluster, gene, avg_log2FC, p_val_adj) %>% head(20)
+
+# Spatial-cluster markers
+Idents(obj) <- obj$spatial_clusters
+markers_spat <- FindAllMarkers(
+  obj, assay = assay, layer = "asinh",
+  only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25
+)
+
+# Take top markers per spatial cluster
+top_markers_spat <- markers_spat %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 5) %>%
+  ungroup()
+
+dplyr::select(top_markers_spat, cluster, gene, avg_log2FC, p_val_adj) %>% head(20)
+
+```
+
+# Feature plots and distributions
+
+Below we show UMAP feature plots and density/violin plots from the asinh data layer.
+
+```{r fig.width=7, fig.height=5, message=FALSE}
+feat_show <- head(VariableFeatures(obj), 6)
+
+# UMAP feature plots
+FeaturePlot(obj, features = feat_show, reduction = "umap", slot = "asinh", ncol = 3)
+```
+
+```{r fig.width=7, fig.height=10, message=FALSE}
+# Ridge/violin per feature
+RidgePlot(obj, features = feat_show, assay = assay, layer = "asinh", ncol = 3)
+```
+
+```{r fig.width=8, fig.height=6, message=FALSE}
+VlnPlot(obj, features = feat_show, assay = assay, pt.size = 0, layer = "asinh")
+```
+
+
+# Cluster summaries and a small heatmap
+
+We will compute cluster means from the asinh layer and draw a heatmap of a few top spatial markers.
+
+Average expression per cluster (expression or spatial clusters):
+
+```{r}
+Idents(obj) <- obj$expr_clusters
+avg_expr <- AverageExpression(obj, assays = assay, layer = "asinh", return.seurat = FALSE)
+head(avg_expr[[assay]])
+```
+
+Heatmap of top spatial markers (using scale.data from ScaleData(..., layer = "asinh")) - be sure they are present after hygiene
+
+```{r fig.width=7, fig.height=5}
+topGenes <- top_markers_spat %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 3) %>% pull(gene) %>% unique()
+topGenes <- intersect(topGenes, rownames(obj[[assay]])) # ensure features exist
+
+# DoHeatmap uses scale.data by default; ensure ScaleData was run from asinh
+DoHeatmap(obj, features = topGenes, assay = assay) + ggtitle("Top spatial markers (scaled from asinh)")
+
+```
+
+# Using the wrapper overlap plot (IMCFovPlot)
+
+This plot overlap allows to you draw RGB/stack overlays on segmentation or centroids, with per-feature layering and optional rotation to match the loader.
+
+```{r fig.width=5, fig.height=5}
+# Max composite over polygons
+IMCFovPlot(
+  obj,
+  features   = c("Vimentin","Fibronectin","pan CK","DNA2"),
+  assay      = assay,
+  layer      = "asinh",
+  boundaries = "segmentation",
+  combine    = "max",
+  normalize  = "minmax",
+  alpha      = 0.9,
+  spatial_rotate_k = 1
+)
+
+# RGB composite
+IMCFovPlot(
+  obj,
+  features   = c("Vimentin","Fibronectin","pan CK"),
+  assay      = assay,
+  layer      = "asinh",
+  boundaries = "segmentation",
+  combine    = "rgb",
+  spatial_rotate_k = 1
+)
+
+# Stacked overlays (darker settings you liked)
+IMCFovPlot(
+  obj,
+  features   = c("Vimentin","Fibronectin","pan CK"),
+  assay      = assay,
+  layer      = "asinh",
+  boundaries = "segmentation",
+  combine    = "stack",
+  colors     = c("#ff005e","#00a8ff","#00d07a"),
+  alpha      = 1.0,
+  alpha_range = c(0.6, 1.0),
+  stack_rescale_alpha_by_n = FALSE,
+  stack_alpha_gamma = 0.7,
+  spatial_rotate_k = 1
+)
+
+```

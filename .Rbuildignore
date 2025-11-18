@@ -1,0 +1,13 @@
+^LICENSE\.md$
+^IMCLoadR\.Rproj$
+^doc$
+^Meta$
+^inst/extdata/WorkSpace_010$
+^\.Rproj\.user$
+^\.Rhistory$
+^\.RData$
+^\.Rds$
+^\.git$
+^\.gitignore$
+^\.DS_Store$
+^\.Rcheck$

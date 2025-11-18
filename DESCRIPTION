@@ -1,0 +1,46 @@
+Type: Package
+Package: IMCLoadR
+Title: IMC Loaders and Plots for Seurat v5
+Version: 0.0.0.9000
+Authors@R: c(
+    person(given = "Meredith A.",
+           family = "Carpenter",
+           role = c("aut","cre"),
+           email = "meredith.a.carpenter@gmail.com",
+           comment = c(ORCID = "")),
+    person(given = "Standard BioTools, Inc.", role = c("cph", "fnd"))
+    )
+Description: Build one Seurat v5 object per FOV from Imaging Mass
+    Cytometry (IMC) data, attach spatial info, and plot intensity overlays
+    on segmentation or centroids.
+License: MIT + file LICENSE
+URL: https://github.com/m-a-carpenter/IMCLoadR
+BugReports: https://github.com/m-a-carpenter/IMCLoadR/issues
+Depends: 
+    R (>= 4.3)
+Imports:
+    rlang,
+    Seurat (>= 5.0.0),
+    SeuratObject (>= 5.0.0),
+    xml2
+Suggests:
+    data.table,
+    dplyr,
+    future,
+    ggplot2,
+    knitr,
+    magick,
+    Matrix,
+    pkgload,
+    rmarkdown,
+    scales,
+    SeuratDisk,
+    sf,
+    terra,
+    testthat (>= 3.0.0)
+VignetteBuilder: 
+    knitr
+Config/testthat/edition: 3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3

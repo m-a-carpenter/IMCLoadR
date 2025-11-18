@@ -1,0 +1,396 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  out.width = "100%"
+)
+```
+
+# IMCLoadR <img src="man/figures/logo.png" align="right" height="140" />
+
+IMCLoadR provides Seurat v5–friendly loaders and plotting helpers for Imaging Mass Cytometry (IMC) data exported from MCD Viewer (MCDV) workspaces after cell segmentation.
+
+The package focuses on:
+- Building one Seurat v5 object per FOV from a MCDV workspace:
+-- Expression stored in a dedicated assay (default: IMC)
+-- Optional `asinh` layer
+-- Spatial centroids and (optionally) segmentation polygons from label masks
+- Storing provenance and spatial metadata in the Seurat tools slot
+-- Simple visualization helpers for plotting IMC intensities over
+segmentation or centroids
+
+-The two main user-facing functions are:
+
+- `LoadIMCSegmented()` – build Seurat v5 objects from an IMC workspace
+- `IMCFovPlot()` – flexible overlay plot for FOVs (segmentation/centroids, max/rgb/stacked composites)
+
+The package is MIT-licensed.
+
+# Installation
+
+`IMCLoadR` is currently developed on GitHub.
+
+```{r eval = FALSE}
+# install.packages("remotes")  # or devtools, if you prefer
+remotes::install_github("m-a-carpenter/IMCLoadR")
+```
+
+Once installed:
+
+```{r}
+library(IMCLoadR)
+library(Seurat)
+library(SeuratObject)
+```
+
+Optional, but recommended for full functionality:
+
+```{r}
+# Enable additional features:
+# - terra/sf: segmentation polygon reconstruction
+# - magick: mask/background images
+# - dplyr, ggplot2, scales: plotting and summaries
+install.packages(c(
+  "terra", "sf", "magick",
+  "ggplot2", "dplyr", "scales"
+))
+```
+
+# Expected input: MCDV workspace layout
+
+`LoadIMCSegmented()` expects a top-level workspace directory exported from MCDV after segmentation, with a structure similar to:
+
+WorkSpace_010/
+  CellSegmentation/
+    IMC-Sample-Tissue/
+      A01_BC_001/
+        SingleCellObjects.csv
+        Cell_mask.tiff
+      A02_BC_002/
+        SingleCellObjects.csv
+        Cell_mask.tiff
+      ...
+  tiff_multi_page_export/
+    IMC-Sample-Tissue/
+      A01_BC_001/
+        A01_BC_001.ome.tiff
+        A01_BC_001.ome.xml
+        before_ablation.png
+        after_ablation.png
+        A01_BC_001_01_Panorama_001.png
+      ...
+
+The loader:
+
+- Reads per-cell CSVs (SingleCellObjects.csv)
+- Uses the mask TIFF (Cell_mask.tiff) as a label map (if present) to reconstruct segmentation polygons
+- Optionally reads OME metadata for pixel size (if XML exists)
+- Creates one Seurat object per FOV, with assay + spatial data attached
+
+# Quick start
+
+## Example data
+
+The vignette and tests are designed to work with a small toy workspace shipped under inst/extdata in the package.
+```{r}
+library(IMCLoadR)
+library(Seurat)
+library(SeuratObject)
+library(ggplot2)
+
+topdir <- system.file("extdata/wsmin", package = "IMCLoadR")
+topdir
+```
+
+If this returns a non-empty path, you can run the full example locally.
+If you have your own workspace on disk, simply set topdir to that path instead.
+
+## Load IMC data into Seurat v5 objects
+
+```{r}
+objs <- LoadIMCSegmented(
+  top_dir                      = topdir,
+  keep_unlabeled_channels      = FALSE,
+  add_asinh_layer              = TRUE,
+  asinh_cofactor               = 5,
+  build_segmentation_from_mask = TRUE,
+  default_boundary             = "segmentation",
+  verbose                      = TRUE,
+  spatial_rotate_k             = 3    # rotate by 270° for slide alignment
+)
+
+length(objs)        # one Seurat object per FOV
+names(objs)
+```
+
+## Pick one FOV to work with:
+
+```{r}
+obj   <- objs[[1]]
+assay <- DefaultAssay(obj)         # usually "IMC"
+fov   <- SeuratObject::DefaultFOV(obj)
+
+assay
+fov
+```
+
+# What the loader adds
+## Assay + layers
+
+By default, `LoadIMCSegmented()`:
+
+- Creates an assay (default: "IMC")
+- Stores expression in the counts layer
+- Optionally adds an asinh layer derived from counts
+
+```{r}
+SeuratObject::Layers(obj[[assay]])
+```
+
+You can then use Seurat v5’s layer-aware functions downstream (`NormalizeData`, `ScaleData`, `FindAllMarkers`, etc.) with `layer = ...`.
+
+## Metadata and QC
+
+The loader writes cell-level QC into meta.data, including:
+- `cell_id`, `centroid_x`, `centroid_y`
+- `cell_area_um2` (if available / computed)
+- `nCount_IMC`, `nFeature_IMC` (from the chosen layer)
+
+```{r}
+head(obj@meta.data[, c("cell_id", "centroid_x", "centroid_y",
+                       "cell_area_um2", "nCount_IMC", "nFeature_IMC")])
+```
+
+Common QC views:
+
+```{r}
+VlnPlot(obj, features = "nCount_IMC", layer = "counts", pt.size = 0) +
+  ggtitle("Per-cell total intensity (nCount_IMC)")
+
+FeatureScatter(
+  obj,
+  feature1 = "nCount_IMC",
+  feature2 = "nFeature_IMC"
+) + ggtitle("IMC QC: counts vs detected features")
+
+```
+
+## Spatial information in the tools slot
+
+`LoadIMCSegmented()` stores provenance and spatial metadata in the Seurat tools slot under "LoadIMCSegmented", for example:
+
+- Paths:
+-- `top_dir`, project name, FOV name
+-- Single-cell CSV path, mask path, panorama image path, OME TIFF
+- Scale factors:
+-- Pixel dimensions (width/height)
+-- Micron-per-pixel estimates from OME metadata
+- Spatial orientation:
+-- `rotate_k`, center (`cx`, `cy`)
+- Segmentation coordinates:
+-- Raw polygon coordinates per FOV (if segmentation was built)
+
+You can examine these via:
+
+```{r}
+tool <- SeuratObject::Tool(obj, "LoadIMCSegmented")
+str(tool, max.level = 1)
+```
+
+or for a specific component, e.g.:
+
+```{r}
+tool$paths
+tool$scale_factors
+tool$spatial_orientation
+names(tool$segmentation_coords)
+```
+
+# Normalization and scaling
+
+If you added an `asinh` layer, you can keep that as a working layer and use `ScaleData()` for downstream analyses.
+
+```{r}
+layers_now <- SeuratObject::Layers(obj[[assay]])
+src_layer  <- if ("asinh" %in% layers_now) "asinh" else if ("data" %in% layers_now) "data" else "counts"
+
+obj <- ScaleData(
+  object   = obj,
+  assay    = assay,
+  features = rownames(obj[[assay]]),
+  layer    = src_layer,
+  verbose  = TRUE
+)
+```
+
+If you want Seurat’s `NormalizeData()` in addition, you can (for IMC, `CLR` is often a sensible choice):
+
+```{r}
+obj <- NormalizeData(
+  object = obj,
+  assay  = assay,
+  normalization.method = "CLR",
+  margin = 2,         # per-cell
+  verbose = TRUE
+)
+```
+
+# Dimensionality reduction and clustering
+
+A typical IMC workflow might look like:
+
+```{r}
+# choose features based on variance in the asinh layer
+M_asinh <- SeuratObject::LayerData(obj[[assay]], layer = "asinh")
+rv      <- apply(M_asinh, 1, stats::var, na.rm = TRUE)
+rv[!is.finite(rv)] <- 0
+
+vf <- names(sort(rv, decreasing = TRUE))
+VariableFeatures(obj) <- vf
+
+# clean slate for reductions/graphs
+obj@reductions$pca  <- NULL
+obj@reductions$umap <- NULL
+obj@graphs$pca_nn   <- NULL
+obj@graphs$pca_snn  <- NULL
+
+# PCA on scaled asinh
+npcs <- min(10, max(2, floor(length(vf) / 3)))
+obj  <- RunPCA(
+  object   = obj,
+  assay    = assay,
+  features = vf,
+  npcs     = npcs,
+  approx   = FALSE,
+  layer    = "scale.data"
+)
+
+# Neighbors + expression clusters
+obj <- FindNeighbors(obj, reduction = "pca", dims = 1:npcs,
+                     graph.name = c("pca_nn","pca_snn"))
+obj <- FindClusters(obj, graph.name = "pca_snn", resolution = 0.4,
+                    cluster.name = "expr_clusters", random.seed = 1234)
+
+# UMAP
+obj <- RunUMAP(
+  object      = obj,
+  reduction   = "pca",
+  dims        = 1:npcs,
+  umap.method = "uwot",
+  metric      = "cosine",
+  n.neighbors = 30,
+  min.dist    = 0.3,
+  spread      = 1.0,
+  seed.use    = 1234
+)
+
+DimPlot(obj, reduction = "umap", group.by = "expr_clusters", label = TRUE)
+```
+
+# Using `IMCFovPlot()` for overlays
+
+`IMCFovPlot()` is a convenience wrapper to plot overlayed intensities on the mask background, using either segmentation polygons (preferred) or centroids.
+
+Key arguments:
+
+- `features`: one or more proteins to overlay
+- `boundaries`: "segmentation" or "centroids"
+- `combine`: "max", "mean", "sum", "rgb", "stack"
+- `layer`: layer to pull from (commonly "asinh" or "scale.data")
+- `spatial_rotate_k`: visualization-only rotation (0/1/2/3 → 0°/90°/180°/270°)
+
+Example usages:
+
+```{r}
+library(ggplot2)
+
+# Max composite over segmentation polygons
+IMCFovPlot(
+  obj,
+  features   = c("Vimentin", "Fibronectin", "pan CK", "DNA2"),
+  assay      = assay,
+  layer      = "asinh",
+  boundaries = "segmentation",
+  combine    = "max",
+  normalize  = "minmax",
+  alpha      = 0.9,
+  spatial_rotate_k = 1
+)
+
+# RGB composite
+IMCFovPlot(
+  obj,
+  features   = c("Vimentin", "Fibronectin", "pan CK"),
+  assay      = assay,
+  layer      = "asinh",
+  boundaries = "segmentation",
+  combine    = "rgb",
+  spatial_rotate_k = 1
+)
+
+# Stacked overlays with custom colors
+IMCFovPlot(
+  obj,
+  features   = c("Vimentin", "Fibronectin", "pan CK"),
+  assay      = assay,
+  layer      = "asinh",
+  boundaries = "segmentation",
+  combine    = "stack",
+  colors     = c("#ff005e", "#00a8ff", "#00d07a"),
+  alpha      = 1.0,
+  alpha_range = c(0.6, 1.0),
+  stack_rescale_alpha_by_n = FALSE,
+  stack_alpha_gamma = 0.7,
+  spatial_rotate_k = 1
+)
+```
+
+If segmentation is not available, you can fall back to centroids by setting `boundaries = "centroids"`.
+
+# Vignettes
+
+The package includes a more detailed workflow vignette:
+
+```{r}
+browseVignettes("IMCLoadR")
+```
+
+or, after installation:
+
+```{r}
+vignette("IMCLoadR", package = "IMCLoadR")
+```
+
+The vignette walks through:
+- Loading a workspace with LoadIMCSegmented()
+- Inspecting QC and provenance
+- Basic dimensionality reduction and clustering
+- Spatial overlays and marker discovery
+
+# Contributing
+
+Issues and pull requests are welcome!
+
+- Bug reports:
+https://github.com/m-a-carpenter/IMCLoadR/issues
+
+- Contributions:
+-- Fork the repo
+-- Create a feature branch
+-- Add tests where reasonable
+-- Run devtools::check() before opening a PR
+
+For substantial interface changes, it’s helpful to open an issue first to discuss design and fit with Seurat v5 expectations.
+
+# License
+
+This project is released under the MIT License.
+
+See the `LICENSE` file for details.
